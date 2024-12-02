@@ -122,6 +122,13 @@ use crate::htslib;
 pub use crate::bcf::header::{Header, HeaderRecord};
 pub use crate::bcf::record::Record;
 
+/// An enum representing different types of indices
+#[derive(Debug)]
+pub enum Index {
+    Tabix(*mut htslib::tbx_t),
+    Bcf(*mut htslib::hts_idx_t),
+}
+
 /// A trait for a BCF reader with a read method.
 pub trait Read: Sized {
     /// Read the next record.
@@ -160,6 +167,9 @@ pub trait Read: Sized {
 pub struct Reader {
     inner: *mut htslib::htsFile,
     header: Rc<HeaderView>,
+    index: Option<Index>,
+    itr: Option<*mut htslib::hts_itr_t>,
+    kstring: htslib::kstring_t,
 }
 
 unsafe impl Send for Reader {}
@@ -182,7 +192,10 @@ impl Reader {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         match path.as_ref().to_str() {
             Some(p) if !path.as_ref().exists() => Err(Error::FileNotFound { path: p.into() }),
-            Some(p) => Self::new(p.as_bytes()),
+            Some(p) => {
+                let reader = Self::new(p.as_bytes())?;
+                Ok(reader)
+            }
             _ => Err(Error::NonUnicodePath),
         }
     }
@@ -200,26 +213,179 @@ impl Reader {
     fn new(path: &[u8]) -> Result<Self> {
         let htsfile = bcf_open(path, b"r")?;
         let header = unsafe { htslib::bcf_hdr_read(htsfile) };
-        Ok(Reader {
+        let mut r = Reader {
             inner: htsfile,
             header: Rc::new(HeaderView::new(header)),
+            index: None,
+            itr: None,
+            kstring: htslib::kstring_t {
+                l: 0,
+                m: 0,
+                s: std::ptr::null_mut(),
+            },
+        };
+
+        _ = r.load_index(); // Ignore error if index doesn't exist
+        Ok(r)
+    }
+
+    /// Load the index for this reader
+    fn load_index(&mut self) -> Result<()> {
+        unsafe {
+            // First try BCF/CSI index
+            let idx = htslib::hts_idx_load(
+                ffi::CStr::from_ptr((*self.inner).fn_).as_ptr(),
+                htslib::HTS_FMT_CSI as i32,
+            );
+            if !idx.is_null() {
+                self.index = Some(Index::Bcf(idx));
+                return Ok(());
+            }
+
+            // Then try tabix index
+            let tbx = htslib::tbx_index_load(ffi::CStr::from_ptr((*self.inner).fn_).as_ptr());
+            if !tbx.is_null() {
+                self.index = Some(Index::Tabix(tbx));
+                return Ok(());
+            }
+        }
+        let f: String = unsafe { ffi::CStr::from_ptr((*self.inner).fn_).to_string_lossy() }.into();
+        Err(Error::FileNotFound {
+            path: format!("index for {f}").into(),
         })
+    }
+
+    /// Jump to the given region.
+    ///
+    /// # Arguments
+    ///
+    /// * `rid` - numeric ID of the reference to jump to; use `HeaderView::name2rid` for resolving
+    ///           contig name to ID.
+    /// * `start` - `0`-based **inclusive** start coordinate of region on reference.
+    /// * `end` - Optional `0`-based **inclusive** end coordinate of region on reference. If `None`
+    /// is given, records are fetched from `start` until the end of the contig.
+    ///
+    /// # Note
+    /// The entire contig can be fetched by setting `start` to `0` and `end` to `None`.
+    pub fn fetch(&mut self, rid: u32, start: u64, end: Option<u64>) -> Result<()> {
+        let contig = self.header.rid2name(rid)?;
+        let contig = ffi::CString::new(contig).unwrap();
+
+        match &self.index {
+            Some(Index::Bcf(idx)) => unsafe {
+                let itr = htslib::hts_itr_query(
+                    *idx,
+                    rid as i32,
+                    start as i64,
+                    end.unwrap_or(i64::MAX as u64) as i64,
+                    Some(htslib::bcf_readrec),
+                );
+                if itr.is_null() {
+                    self.itr = None;
+                    return Err(Error::GenomicSeek {
+                        contig: contig.to_str().unwrap().to_owned(),
+                        start,
+                    });
+                }
+                self.itr = Some(itr);
+                Ok(())
+            },
+            Some(Index::Tabix(tbx)) => unsafe {
+                let itr = htslib::hts_itr_query(
+                    (*(*tbx)).idx,
+                    rid as i32,
+                    start as i64,
+                    end.unwrap_or(i64::MAX as u64) as i64,
+                    Some(htslib::tbx_readrec),
+                );
+                if itr.is_null() {
+                    self.itr = None;
+                    return Err(Error::GenomicSeek {
+                        contig: contig.to_str().unwrap().to_owned(),
+                        start,
+                    });
+                }
+                self.itr = Some(itr);
+                Ok(())
+            },
+            None => {
+                let f: String =
+                    unsafe { ffi::CStr::from_ptr((*self.inner).fn_).to_string_lossy() }.into();
+                Err(Error::FileNotFound {
+                    path: format!("index for {f}").into(),
+                })
+            }
+        }
     }
 }
 
 impl Read for Reader {
     fn read(&mut self, record: &mut record::Record) -> Option<Result<()>> {
-        match unsafe { htslib::bcf_read(self.inner, self.header.inner, record.inner) } {
-            0 => {
-                unsafe {
-                    // Always unpack record.
-                    htslib::bcf_unpack(record.inner_mut(), htslib::BCF_UN_ALL as i32);
+        if let Some(itr) = &self.itr {
+            match &self.index {
+                Some(Index::Bcf(_)) => unsafe {
+                    let r = htslib::hts_itr_next(
+                        (*self.inner).fp.bgzf,
+                        *itr,
+                        record.inner as *mut _,
+                        std::ptr::null_mut(),
+                    );
+                    if r == -1 {
+                        // no more data.
+                        htslib::hts_itr_destroy(*itr);
+                        self.itr = None;
+                        None
+                    } else if r == 0 {
+                        htslib::bcf_unpack(record.inner_mut(), htslib::BCF_UN_ALL as i32);
+                        // TODO: bcf_subset_format()
+
+                        record.set_header(Rc::clone(&self.header));
+                        Some(Ok(()))
+                    } else {
+                        Some(Err(Error::BcfInvalidRecord))
+                    }
+                },
+                Some(Index::Tabix(tbx)) => unsafe {
+                    let slen = htslib::hts_itr_next(
+                        (*self.inner).fp.bgzf,
+                        *itr,
+                        &mut self.kstring as *mut _ as *mut _,
+                        *tbx as *mut _,
+                    );
+                    if slen <= 0 {
+                        // no more data.
+                        htslib::hts_itr_destroy(*itr);
+                        self.itr = None;
+                        None
+                    } else {
+                        htslib::vcf_parse(
+                            &mut self.kstring,
+                            self.header.inner,
+                            record.inner as *mut _,
+                        );
+                        htslib::bcf_unpack(record.inner_mut(), htslib::BCF_UN_ALL as i32);
+
+                        record.set_header(Rc::clone(&self.header));
+                        Some(Ok(()))
+                    }
+                },
+                None => {
+                    unreachable!()
                 }
-                record.set_header(Rc::clone(&self.header));
-                Some(Ok(()))
             }
-            -1 => None,
-            _ => Some(Err(Error::BcfInvalidRecord)),
+        } else {
+            match unsafe { htslib::bcf_read(self.inner, self.header.inner, record.inner) } {
+                0 => {
+                    unsafe {
+                        // Always unpack record.
+                        htslib::bcf_unpack(record.inner_mut(), htslib::BCF_UN_ALL as i32);
+                    }
+                    record.set_header(Rc::clone(&self.header));
+                    Some(Ok(()))
+                }
+                -1 => None,
+                _ => Some(Err(Error::BcfInvalidRecord)),
+            }
         }
     }
 
@@ -243,178 +409,18 @@ impl Read for Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
+        // Free the index if it exists
+        if let Some(index) = &self.index {
+            unsafe {
+                match index {
+                    Index::Bcf(idx) => htslib::hts_idx_destroy(*idx),
+                    Index::Tabix(tbx) => htslib::tbx_destroy(*tbx),
+                }
+            }
+        }
         unsafe {
             htslib::hts_close(self.inner);
         }
-    }
-}
-
-/// An indexed VCF/BCF reader.
-#[derive(Debug)]
-pub struct IndexedReader {
-    /// The synced VCF/BCF reader to use internally.
-    inner: *mut htslib::bcf_srs_t,
-    /// The header.
-    header: Rc<HeaderView>,
-
-    /// The position of the previous fetch, if any.
-    current_region: Option<(u32, u64, Option<u64>)>,
-}
-
-unsafe impl Send for IndexedReader {}
-
-impl IndexedReader {
-    /// Create a new `IndexedReader` from path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - the path to open.
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        match path.to_str() {
-            Some(p) if path.exists() => {
-                Self::new(&ffi::CString::new(p).map_err(|_| Error::NonUnicodePath)?)
-            }
-            Some(p) => Err(Error::FileNotFound { path: p.into() }),
-            None => Err(Error::NonUnicodePath),
-        }
-    }
-
-    /// Create a new `IndexedReader` from an URL.
-    pub fn from_url(url: &Url) -> Result<Self> {
-        Self::new(&ffi::CString::new(url.as_str()).unwrap())
-    }
-
-    /// Create a new `IndexedReader`.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - the path. Use "-" for stdin.
-    fn new(path: &ffi::CStr) -> Result<Self> {
-        // Create reader and require existence of index file.
-        let ser_reader = unsafe { htslib::bcf_sr_init() };
-        unsafe {
-            htslib::bcf_sr_set_opt(ser_reader, 0);
-        } // 0: BCF_SR_REQUIRE_IDX
-          // Attach a file with the path from the arguments.
-        if unsafe { htslib::bcf_sr_add_reader(ser_reader, path.as_ptr()) } >= 0 {
-            let header = Rc::new(HeaderView::new(unsafe {
-                htslib::bcf_hdr_dup((*(*ser_reader).readers.offset(0)).header)
-            }));
-            Ok(IndexedReader {
-                inner: ser_reader,
-                header,
-                current_region: None,
-            })
-        } else {
-            Err(Error::BcfOpen {
-                target: path.to_str().unwrap().to_owned(),
-            })
-        }
-    }
-
-    /// Jump to the given region.
-    ///
-    /// # Arguments
-    ///
-    /// * `rid` - numeric ID of the reference to jump to; use `HeaderView::name2rid` for resolving
-    ///           contig name to ID.
-    /// * `start` - `0`-based **inclusive** start coordinate of region on reference.
-    /// * `end` - Optional `0`-based **inclusive** end coordinate of region on reference. If `None`
-    /// is given, records are fetched from `start` until the end of the contig.
-    ///
-    /// # Note
-    /// The entire contig can be fetched by setting `start` to `0` and `end` to `None`.
-    pub fn fetch(&mut self, rid: u32, start: u64, end: Option<u64>) -> Result<()> {
-        let contig = self.header.rid2name(rid)?;
-        let contig = ffi::CString::new(contig).unwrap();
-        if unsafe { htslib::bcf_sr_seek(self.inner, contig.as_ptr(), start as i64) } != 0 {
-            Err(Error::GenomicSeek {
-                contig: contig.to_str().unwrap().to_owned(),
-                start,
-            })
-        } else {
-            self.current_region = Some((rid, start, end));
-            Ok(())
-        }
-    }
-}
-
-impl Read for IndexedReader {
-    fn read(&mut self, record: &mut record::Record) -> Option<Result<()>> {
-        match unsafe { htslib::bcf_sr_next_line(self.inner) } {
-            0 => {
-                if unsafe { (*self.inner).errnum } != 0 {
-                    Some(Err(Error::BcfInvalidRecord))
-                } else {
-                    None
-                }
-            }
-            i => {
-                assert!(i > 0, "Must not be negative");
-                // Note that the sync BCF reader has a different interface than the others
-                // as it keeps its own buffer already for each record.  An alternative here
-                // would be to replace the `inner` value by an enum that can be a pointer
-                // into a synced reader or an owning popinter to an allocated record.
-                unsafe {
-                    htslib::bcf_copy(
-                        record.inner,
-                        *(*(*self.inner).readers.offset(0)).buffer.offset(0),
-                    );
-                }
-
-                unsafe {
-                    // Always unpack record.
-                    htslib::bcf_unpack(record.inner_mut(), htslib::BCF_UN_ALL as i32);
-                }
-
-                record.set_header(Rc::clone(&self.header));
-
-                match self.current_region {
-                    Some((rid, _start, end)) => {
-                        let endpos = match end {
-                            Some(e) => e,
-                            None => u64::MAX,
-                        };
-                        if Some(rid) == record.rid() && record.pos() as u64 <= endpos {
-                            Some(Ok(()))
-                        } else {
-                            None
-                        }
-                    }
-                    None => Some(Ok(())),
-                }
-            }
-        }
-    }
-
-    fn records(&mut self) -> Records<'_, Self> {
-        Records { reader: self }
-    }
-
-    fn set_threads(&mut self, n_threads: usize) -> Result<()> {
-        assert!(n_threads > 0, "n_threads must be > 0");
-
-        let r = unsafe { htslib::bcf_sr_set_threads(self.inner, n_threads as i32) };
-        if r != 0 {
-            Err(Error::SetThreads)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn header(&self) -> &HeaderView {
-        &self.header
-    }
-
-    fn empty_record(&self) -> Record {
-        Record::new(Rc::clone(&self.header))
-    }
-}
-
-impl Drop for IndexedReader {
-    fn drop(&mut self) {
-        unsafe { htslib::bcf_sr_destroy(self.inner) };
     }
 }
 
@@ -925,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_fetch() {
-        let mut bcf = IndexedReader::from_path(&"test/test.bcf").expect("Error opening file.");
+        let mut bcf = Reader::from_path(&"test/test.bcf").expect("Error opening file.");
         bcf.set_threads(2).unwrap();
         let rid = bcf
             .header()
@@ -933,12 +939,28 @@ mod tests {
             .expect("Translating from contig '1' to ID failed.");
         bcf.fetch(rid, 10_033, Some(10_060))
             .expect("Fetching failed");
-        assert_eq!(bcf.records().count(), 28);
+        assert_eq!(bcf.records().count(), 27);
+    }
+
+    #[test]
+    fn test_fetch_vcf() {
+        let mut bcf = Reader::from_path(&"test/test.vcf.gz").expect("Error opening file.");
+        bcf.set_threads(2).unwrap();
+        let rid = bcf
+            .header()
+            .name2rid(b"1")
+            .expect("Translating from contig '1' to ID failed.");
+        bcf.fetch(rid, 10_033, Some(10_060))
+            .expect("Fetching failed");
+        assert_eq!(bcf.records().count(), 27);
+        for r in bcf.records() {
+            assert!(r.expect("Error reading record.").pos() > 10_060);
+        }
     }
 
     #[test]
     fn test_fetch_all() {
-        let mut bcf = IndexedReader::from_path(&"test/test.bcf").expect("Error opening file.");
+        let mut bcf = Reader::from_path(&"test/test.bcf").expect("Error opening file.");
         bcf.set_threads(2).unwrap();
         let rid = bcf
             .header()
@@ -950,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_fetch_open_ended() {
-        let mut bcf = IndexedReader::from_path(&"test/test.bcf").expect("Error opening file.");
+        let mut bcf = Reader::from_path(&"test/test.bcf").expect("Error opening file.");
         bcf.set_threads(2).unwrap();
         let rid = bcf
             .header()
@@ -962,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_fetch_start_greater_than_last_vcf_pos() {
-        let mut bcf = IndexedReader::from_path(&"test/test.bcf").expect("Error opening file.");
+        let mut bcf = Reader::from_path(&"test/test.bcf").expect("Error opening file.");
         bcf.set_threads(2).unwrap();
         let rid = bcf
             .header()
